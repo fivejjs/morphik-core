@@ -53,6 +53,8 @@ def should_ignore_directory(dirname: str) -> bool:
         "build",
         "dist",
         "node_modules",
+        ".next",
+        "storage",
     }
     return dirname in ignore_dirs
 
@@ -66,16 +68,15 @@ def get_target_directories(mode: str, root_dir: str) -> Set[str]:
         "core": ["core"],
         "sdk": ["sdks"],
         "test": ["core/tests", "sdks/python/tests"],
+        "ui-component": ["ee/ui-component"],
     }
 
     return {os.path.join(root_dir, d) for d in mode_dirs.get(mode, [])}
 
 
-def aggregate_python_files(
-    root_dir: str, output_file: str, script_name: str, mode: str = "all"
-) -> None:
+def aggregate_files(root_dir: str, output_file: str, script_name: str, mode: str = "all") -> None:
     """
-    Recursively search through directories and aggregate Python files.
+    Recursively search through directories and aggregate relevant files based on mode.
 
     Args:
         root_dir: Root directory to start search
@@ -87,7 +88,7 @@ def aggregate_python_files(
     tree = DirectoryTree()
     target_dirs = get_target_directories(mode, root_dir)
 
-    print(f"\nProcessing Python files in {mode} mode...")
+    print(f"\nProcessing files in {mode} mode...")
     print(f"Target directories: {', '.join(target_dirs)}")
 
     with open(output_file, "w", encoding="utf-8") as outfile:
@@ -117,18 +118,28 @@ Root Directory: {root_dir}
                     rel_path = os.path.relpath(os.path.join(dirpath, d), root_dir)
                     tree.add_path(rel_path, is_file=False)
 
-                # Process Python files
-                python_files = [
+                # Determine relevant file extensions based on mode
+                if mode == "ui-component":
+                    relevant_extensions = (".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json")
+                else:
+                    relevant_extensions = (".py",)
+
+                # Process relevant files
+                relevant_files = [
                     f
                     for f in filenames
-                    if f.endswith(".py")
+                    if (
+                        f.endswith(relevant_extensions)
+                        or f.lower() == "dockerfile"
+                        or f.lower() == "docker-compose.yml"
+                    )
                     and f != "__init__.py"
                     and f != script_name
                     and f != output_file
                 ]
 
-                for py_file in python_files:
-                    file_path = os.path.join(dirpath, py_file)
+                for file_name in relevant_files:
+                    file_path = os.path.join(dirpath, file_name)
                     rel_path = os.path.relpath(file_path, root_dir)
 
                     # Add file to tree
@@ -148,17 +159,27 @@ Root Directory: {root_dir}
             for dirpath, dirnames, filenames in os.walk(target_dir, topdown=True):
                 dirnames[:] = [d for d in dirnames if not should_ignore_directory(d)]
 
-                python_files = [
+                # Determine relevant file extensions based on mode
+                if mode == "ui-component":
+                    relevant_extensions = (".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json")
+                else:
+                    relevant_extensions = (".py", ".toml", ".yaml", ".yml")
+
+                relevant_files = [
                     f
                     for f in filenames
-                    if f.endswith(".py")
+                    if (
+                        f.endswith(relevant_extensions)
+                        or f.lower() == "dockerfile"
+                        or f.lower() == "docker-compose.yml"
+                    )
                     and f != "__init__.py"
                     and f != script_name
                     and f != output_file
                 ]
 
-                for py_file in python_files:
-                    file_path = os.path.join(dirpath, py_file)
+                for file_name in relevant_files:
+                    file_path = os.path.join(dirpath, file_name)
                     rel_path = os.path.relpath(file_path, root_dir)
 
                     try:
@@ -182,7 +203,7 @@ def main():
     parser = argparse.ArgumentParser(description="Aggregate Python files with directory structure")
     parser.add_argument(
         "--mode",
-        choices=["all", "core", "sdk", "test"],
+        choices=["all", "core", "sdk", "test", "ui-component"],
         default="all",
         help="Which directories to process",
     )
@@ -197,7 +218,7 @@ def main():
     print(f"Output: {args.output}")
     print(f"Root directory: {current_dir}")
 
-    aggregate_python_files(
+    aggregate_files(
         root_dir=current_dir,
         output_file=args.output,
         script_name=script_name,

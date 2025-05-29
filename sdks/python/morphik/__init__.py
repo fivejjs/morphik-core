@@ -2,9 +2,9 @@
 Morphik Python SDK for document ingestion and querying.
 """
 
-from .sync import Morphik
 from .async_ import AsyncMorphik
 from .models import Document
+from .sync import Morphik
 
 __all__ = [
     "Morphik",
@@ -12,4 +12,4 @@ __all__ = [
     "Document",
 ]
 
-__version__ = "0.1.4"
+__version__ = "0.1.8"

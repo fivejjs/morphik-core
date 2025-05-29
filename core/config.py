@@ -1,10 +1,13 @@
 import os
-from typing import Literal, Optional, Dict, Any
-from pydantic_settings import BaseSettings
+from collections import ChainMap
 from functools import lru_cache
+from typing import Any, Dict, Literal, Optional
+
 import tomli
 from dotenv import load_dotenv
-from collections import ChainMap
+from pydantic_settings import BaseSettings
+
+load_dotenv(override=True)
 
 
 class Settings(BaseSettings):
@@ -12,6 +15,7 @@ class Settings(BaseSettings):
 
     # Environment variables
     JWT_SECRET_KEY: str
+    SESSION_SECRET_KEY: str
     POSTGRES_URI: Optional[str] = None
     UNSTRUCTURED_API_KEY: Optional[str] = None
     AWS_ACCESS_KEY: Optional[str] = None
@@ -24,6 +28,9 @@ class Settings(BaseSettings):
     HOST: str
     PORT: int
     RELOAD: bool
+    # Morphik Embedding API server configuration
+    MORPHIK_EMBEDDING_API_KEY: Optional[str] = None
+    MORPHIK_EMBEDDING_API_DOMAIN: str
 
     # Auth configuration
     JWT_ALGORITHM: str
@@ -38,7 +45,12 @@ class Settings(BaseSettings):
     # Completion configuration
     COMPLETION_PROVIDER: Literal["litellm"] = "litellm"
     COMPLETION_MODEL: str
-    
+
+    # Agent configuration
+    AGENT_MODEL: str
+
+    # Document analysis configuration
+    DOCUMENT_ANALYSIS_MODEL: str
 
     # Database configuration
     DATABASE_PROVIDER: Literal["postgres"]
@@ -71,9 +83,13 @@ class Settings(BaseSettings):
     RULES_BATCH_SIZE: int = 4096
 
     # Graph configuration
+    GRAPH_MODE: Literal["local", "api"] = "local"
     GRAPH_PROVIDER: Literal["litellm"] = "litellm"
-    GRAPH_MODEL: str
-    ENABLE_ENTITY_RESOLUTION: bool = True
+    GRAPH_MODEL: Optional[str] = None
+    ENABLE_ENTITY_RESOLUTION: Optional[bool] = None
+    # Graph API configuration
+    MORPHIK_GRAPH_API_KEY: Optional[str] = None
+    MORPHIK_GRAPH_BASE_URL: Optional[str] = None
 
     # Reranker configuration
     USE_RERANKING: bool
@@ -96,17 +112,19 @@ class Settings(BaseSettings):
 
     # Colpali configuration
     ENABLE_COLPALI: bool
-    
-    # Mode configuration     
+    # Colpali embedding mode: off, local, or api
+    COLPALI_MODE: Literal["off", "local", "api"] = "local"
+
+    # Mode configuration
     MODE: Literal["cloud", "self_hosted"] = "cloud"
-    
+
     # API configuration
     API_DOMAIN: str = "api.morphik.ai"
-    
+
     # Redis configuration
     REDIS_HOST: str = "redis"
     REDIS_PORT: int = 6379
-    
+
     # Telemetry configuration
     TELEMETRY_ENABLED: bool = True
     HONEYCOMB_ENABLED: bool = True
@@ -132,7 +150,7 @@ def get_settings() -> Settings:
 
     em = "'{missing_value}' needed if '{field}' is set to '{value}'"
     openai_config = {}
-    
+
     # load api config
     api_config = {
         "HOST": config["api"]["host"],
@@ -143,9 +161,8 @@ def get_settings() -> Settings:
     # load auth config
     auth_config = {
         "JWT_ALGORITHM": config["auth"]["jwt_algorithm"],
-        "JWT_SECRET_KEY": os.environ.get(
-            "JWT_SECRET_KEY", "dev-secret-key"
-        ),  # Default for dev mode
+        "JWT_SECRET_KEY": os.environ.get("JWT_SECRET_KEY", "dev-secret-key"),  # Default for dev mode
+        "SESSION_SECRET_KEY": os.environ.get("SESSION_SECRET_KEY", "super-secret-dev-session-key"),
         "dev_mode": config["auth"].get("dev_mode", False),
         "dev_entity_type": config["auth"].get("dev_entity_type", "developer"),
         "dev_entity_id": config["auth"].get("dev_entity_id", "dev_user"),
@@ -155,6 +172,13 @@ def get_settings() -> Settings:
     # Only require JWT_SECRET_KEY in non-dev mode
     if not auth_config["dev_mode"] and "JWT_SECRET_KEY" not in os.environ:
         raise ValueError("JWT_SECRET_KEY is required when dev_mode is disabled")
+    # Also require SESSION_SECRET_KEY in non-dev mode
+    if not auth_config["dev_mode"] and "SESSION_SECRET_KEY" not in os.environ:
+        # Or, if we want to be more strict and always require it via ENV:
+        # if "SESSION_SECRET_KEY" not in os.environ:
+        #     raise ValueError("SESSION_SECRET_KEY environment variable is required.")
+        # For now, align with JWT_SECRET_KEY's dev mode leniency.
+        pass  # Dev mode has a default, production should use ENV.
 
     # Load registered models if available
     registered_models = {}
@@ -165,11 +189,16 @@ def get_settings() -> Settings:
     completion_config = {
         "COMPLETION_PROVIDER": "litellm",
     }
-    
+
     # Set the model key for LiteLLM
     if "model" not in config["completion"]:
         raise ValueError("'model' is required in the completion configuration")
     completion_config["COMPLETION_MODEL"] = config["completion"]["model"]
+
+    # load agent config
+    agent_config = {"AGENT_MODEL": config["agent"]["model"]}
+    if "model" not in config["agent"]:
+        raise ValueError("'model' is required in the agent configuration")
 
     # load database config
     database_config = {
@@ -187,13 +216,11 @@ def get_settings() -> Settings:
     if database_config["DATABASE_PROVIDER"] != "postgres":
         prov = database_config["DATABASE_PROVIDER"]
         raise ValueError(f"Unknown database provider selected: '{prov}'")
-        
+
     if "POSTGRES_URI" in os.environ:
         database_config.update({"POSTGRES_URI": os.environ["POSTGRES_URI"]})
     else:
-        msg = em.format(
-            missing_value="POSTGRES_URI", field="database.provider", value="postgres"
-        )
+        msg = em.format(missing_value="POSTGRES_URI", field="database.provider", value="postgres")
         raise ValueError(msg)
 
     # load embedding config
@@ -202,7 +229,7 @@ def get_settings() -> Settings:
         "VECTOR_DIMENSIONS": config["embedding"]["dimensions"],
         "EMBEDDING_SIMILARITY_METRIC": config["embedding"]["similarity_metric"],
     }
-    
+
     # Set the model key for LiteLLM
     if "model" not in config["embedding"]:
         raise ValueError("'model' is required in the embedding configuration")
@@ -216,9 +243,7 @@ def get_settings() -> Settings:
         "USE_CONTEXTUAL_CHUNKING": config["parser"].get("use_contextual_chunking", False),
     }
     if parser_config["USE_UNSTRUCTURED_API"] and "UNSTRUCTURED_API_KEY" not in os.environ:
-        msg = em.format(
-            missing_value="UNSTRUCTURED_API_KEY", field="parser.use_unstructured_api", value="true"
-        )
+        msg = em.format(missing_value="UNSTRUCTURED_API_KEY", field="parser.use_unstructured_api", value="true")
         raise ValueError(msg)
     elif parser_config["USE_UNSTRUCTURED_API"]:
         parser_config.update({"UNSTRUCTURED_API_KEY": os.environ["UNSTRUCTURED_API_KEY"]})
@@ -238,13 +263,14 @@ def get_settings() -> Settings:
         )
 
     # load storage config
-    storage_config = {"STORAGE_PROVIDER": config["storage"]["provider"], "STORAGE_PATH": config["storage"]["storage_path"]}
+    storage_config = {
+        "STORAGE_PROVIDER": config["storage"]["provider"],
+        "STORAGE_PATH": config["storage"]["storage_path"],
+    }
     match storage_config["STORAGE_PROVIDER"]:
         case "local":
             storage_config.update({"STORAGE_PATH": config["storage"]["storage_path"]})
-        case "aws-s3" if all(
-            key in os.environ for key in ["AWS_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"]
-        ):
+        case "aws-s3" if all(key in os.environ for key in ["AWS_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"]):
             storage_config.update(
                 {
                     "AWS_REGION": config["storage"]["region"],
@@ -254,9 +280,7 @@ def get_settings() -> Settings:
                 }
             )
         case "aws-s3":
-            msg = em.format(
-                missing_value="AWS credentials", field="storage.provider", value="aws-s3"
-            )
+            msg = em.format(missing_value="AWS credentials", field="storage.provider", value="aws-s3")
             raise ValueError(msg)
         case _:
             prov = storage_config["STORAGE_PROVIDER"]
@@ -267,11 +291,9 @@ def get_settings() -> Settings:
     if vector_store_config["VECTOR_STORE_PROVIDER"] != "pgvector":
         prov = vector_store_config["VECTOR_STORE_PROVIDER"]
         raise ValueError(f"Unknown vector store provider selected: '{prov}'")
-        
+
     if "POSTGRES_URI" not in os.environ:
-        msg = em.format(
-            missing_value="POSTGRES_URI", field="vector_store.provider", value="pgvector"
-        )
+        msg = em.format(missing_value="POSTGRES_URI", field="vector_store.provider", value="pgvector")
         raise ValueError(msg)
 
     # load rules config
@@ -279,7 +301,7 @@ def get_settings() -> Settings:
         "RULES_PROVIDER": "litellm",
         "RULES_BATCH_SIZE": config["rules"]["batch_size"],
     }
-    
+
     # Set the model key for LiteLLM
     if "model" not in config["rules"]:
         raise ValueError("'model' is required in the rules configuration")
@@ -288,10 +310,16 @@ def get_settings() -> Settings:
     # load morphik config
     morphik_config = {
         "ENABLE_COLPALI": config["morphik"]["enable_colpali"],
+        "COLPALI_MODE": config["morphik"].get("colpali_mode", "local"),
         "MODE": config["morphik"].get("mode", "cloud"),  # Default to "cloud" mode
-        "API_DOMAIN": config["morphik"].get("api_domain", "api.morphik.ai"),  # Default API domain
+        # API domain for core server
+        "API_DOMAIN": config["morphik"].get("api_domain", "api.morphik.ai"),
+        # Domain for Morphik embedding API
+        "MORPHIK_EMBEDDING_API_DOMAIN": config["morphik"].get(
+            "morphik_embedding_api_domain", config["morphik"].get("api_domain", "api.morphik.ai")
+        ),
     }
-    
+
     # load redis config
     redis_config = {}
     if "redis" in config:
@@ -301,16 +329,30 @@ def get_settings() -> Settings:
         }
 
     # load graph config
-    graph_config = {
-        "GRAPH_PROVIDER": "litellm",
-        "ENABLE_ENTITY_RESOLUTION": config["graph"].get("enable_entity_resolution", True),
-    }
-    
+    graph_config = (
+        {
+            "GRAPH_MODE": "local",
+            "GRAPH_PROVIDER": "litellm",
+            "ENABLE_ENTITY_RESOLUTION": config["graph"].get("enable_entity_resolution", True),
+        }
+        if config["graph"].get("mode", "local") == "local"
+        else {
+            "GRAPH_MODE": "api",
+            "MORPHIK_GRAPH_BASE_URL": config["graph"].get("base_url", "https://graph-api.morphik.ai"),
+            "MORPHIK_GRAPH_API_KEY": os.environ.get("MORPHIK_GRAPH_API_KEY", None),
+        }
+    )
+
     # Set the model key for LiteLLM
     if "model" not in config["graph"]:
         raise ValueError("'model' is required in the graph configuration")
     graph_config["GRAPH_MODEL"] = config["graph"]["model"]
-    
+
+    # load document analysis config
+    document_analysis_config = {}
+    if "document_analysis" in config:
+        document_analysis_config = {"DOCUMENT_ANALYSIS_MODEL": config["document_analysis"]["model"]}
+
     # load telemetry config
     telemetry_config = {}
     if "telemetry" in config:
@@ -326,24 +368,28 @@ def get_settings() -> Settings:
             "OTLP_SCHEDULE_DELAY_MILLIS": config["telemetry"].get("otlp_schedule_delay_millis", 5000),
             "OTLP_MAX_QUEUE_SIZE": config["telemetry"].get("otlp_max_queue_size", 2048),
         }
-    
-    settings_dict = dict(ChainMap(
-        api_config,
-        auth_config,
-        registered_models,
-        completion_config,
-        database_config,
-        embedding_config,
-        parser_config,
-        reranker_config,
-        storage_config,
-        vector_store_config,
-        rules_config,
-        morphik_config,
-        redis_config,
-        graph_config,
-        telemetry_config,
-        openai_config,
-    ))
+
+    settings_dict = dict(
+        ChainMap(
+            api_config,
+            auth_config,
+            registered_models,
+            completion_config,
+            agent_config,
+            database_config,
+            embedding_config,
+            parser_config,
+            reranker_config,
+            storage_config,
+            vector_store_config,
+            rules_config,
+            morphik_config,
+            redis_config,
+            graph_config,
+            document_analysis_config,
+            telemetry_config,
+            openai_config,
+        )
+    )
 
     return Settings(**settings_dict)

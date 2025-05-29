@@ -2,25 +2,23 @@ import json
 import logging
 from io import BytesIO, IOBase
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union, BinaryIO
+from typing import Any, BinaryIO, Dict, List, Optional, Type, Union
 
 import httpx
-from PIL.Image import Image as PILImage
+from pydantic import BaseModel
 
+from ._internal import FinalChunkResult, RuleOrDict, _MorphikClientLogic
+from .models import CompletionResponse  # Prompt override models
 from .models import (
+    ChunkSource,
     Document,
     DocumentResult,
-    CompletionResponse,
-    IngestTextRequest,
-    ChunkSource,
-    Graph,
     FolderInfo,
-    # Prompt override models
+    Graph,
     GraphPromptOverrides,
+    IngestTextRequest,
     QueryPromptOverrides,
 )
-from .rules import Rule
-from ._internal import _MorphikClientLogic, FinalChunkResult, RuleOrDict
 
 logger = logging.getLogger(__name__)
 
@@ -69,16 +67,16 @@ class AsyncFolder:
     def name(self) -> str:
         """Returns the folder name."""
         return self._name
-        
+
     @property
     def id(self) -> Optional[str]:
         """Returns the folder ID if available."""
         return self._id
-        
+
     async def get_info(self) -> Dict[str, Any]:
         """
         Get detailed information about this folder.
-        
+
         Returns:
             Dict[str, Any]: Detailed folder information
         """
@@ -91,9 +89,8 @@ class AsyncFolder:
                     break
             if not self._id:
                 raise ValueError(f"Folder '{self._name}' not found")
-        
+
         return await self._client._request("GET", f"folders/{self._id}")
-        
 
     def signin(self, end_user_id: str) -> "AsyncUserScope":
         """
@@ -167,7 +164,7 @@ class AsyncFolder:
 
             # Create form data
             form_data = self._client._logic._prepare_ingest_file_form_data(
-                metadata, rules, self._name, None
+                metadata, rules, self._name, None, use_colpali
             )
 
             response = await self._client._request(
@@ -175,7 +172,6 @@ class AsyncFolder:
                 "ingest/file",
                 data=form_data,
                 files=files,
-                params={"use_colpali": str(use_colpali).lower()},
             )
             doc = self._client._logic._parse_document_response(response)
             doc._client = self._client
@@ -216,11 +212,10 @@ class AsyncFolder:
             )
 
             response = await self._client._request(
-                "POST", 
-                "ingest/files", 
-                data=data, 
+                "POST",
+                "ingest/files",
+                data=data,
                 files=file_objects,
-                params={"use_colpali": str(use_colpali).lower()},
             )
 
             if response.get("errors"):
@@ -228,9 +223,7 @@ class AsyncFolder:
                 for error in response["errors"]:
                     logger.error(f"Failed to ingest {error['filename']}: {error['error']}")
 
-            docs = [
-                self._client._logic._parse_document_response(doc) for doc in response["documents"]
-            ]
+            docs = [self._client._logic._parse_document_response(doc) for doc in response["documents"]]
             for doc in docs:
                 doc._client = self._client
             return docs
@@ -293,6 +286,7 @@ class AsyncFolder:
         k: int = 4,
         min_score: float = 0.0,
         use_colpali: bool = True,
+        additional_folders: Optional[List[str]] = None,
     ) -> List[FinalChunkResult]:
         """
         Retrieve relevant chunks within this folder.
@@ -303,12 +297,14 @@ class AsyncFolder:
             k: Number of results (default: 4)
             min_score: Minimum similarity threshold (default: 0.0)
             use_colpali: Whether to use ColPali-style embedding model
+            additional_folders: Optional list of additional folder names to further scope operations
 
         Returns:
             List[FinalChunkResult]: List of relevant chunks
         """
+        effective_folder = self._merge_folders(additional_folders)
         payload = self._client._logic._prepare_retrieve_chunks_request(
-            query, filters, k, min_score, use_colpali, self._name, None
+            query, filters, k, min_score, use_colpali, effective_folder, None
         )
         response = await self._client._request("POST", "retrieve/chunks", data=payload)
         return self._client._logic._parse_chunk_result_list_response(response)
@@ -320,6 +316,7 @@ class AsyncFolder:
         k: int = 4,
         min_score: float = 0.0,
         use_colpali: bool = True,
+        additional_folders: Optional[List[str]] = None,
     ) -> List[DocumentResult]:
         """
         Retrieve relevant documents within this folder.
@@ -330,12 +327,14 @@ class AsyncFolder:
             k: Number of results (default: 4)
             min_score: Minimum similarity threshold (default: 0.0)
             use_colpali: Whether to use ColPali-style embedding model
+            additional_folders: Optional list of additional folder names to further scope operations
 
         Returns:
             List[DocumentResult]: List of relevant documents
         """
+        effective_folder = self._merge_folders(additional_folders)
         payload = self._client._logic._prepare_retrieve_docs_request(
-            query, filters, k, min_score, use_colpali, self._name, None
+            query, filters, k, min_score, use_colpali, effective_folder, None
         )
         response = await self._client._request("POST", "retrieve/docs", data=payload)
         return self._client._logic._parse_document_result_list_response(response)
@@ -353,6 +352,9 @@ class AsyncFolder:
         hop_depth: int = 1,
         include_paths: bool = False,
         prompt_overrides: Optional[Union[QueryPromptOverrides, Dict[str, Any]]] = None,
+        additional_folders: Optional[List[str]] = None,
+        schema: Optional[Union[Type[BaseModel], Dict[str, Any]]] = None,
+        chat_id: Optional[str] = None,
     ) -> CompletionResponse:
         """
         Generate completion using relevant chunks as context within this folder.
@@ -369,10 +371,13 @@ class AsyncFolder:
             hop_depth: Number of relationship hops to traverse in the graph (1-3)
             include_paths: Whether to include relationship paths in the response
             prompt_overrides: Optional customizations for entity extraction, resolution, and query prompts
+            schema: Optional schema for structured output
+            additional_folders: Optional list of additional folder names to further scope operations
 
         Returns:
-            CompletionResponse: Generated completion
+            CompletionResponse: Generated completion or structured output
         """
+        effective_folder = self._merge_folders(additional_folders)
         payload = self._client._logic._prepare_query_request(
             query,
             filters,
@@ -385,14 +390,32 @@ class AsyncFolder:
             hop_depth,
             include_paths,
             prompt_overrides,
-            self._name,
+            effective_folder,
             None,
+            chat_id,
+            schema,
         )
+
+        # Add schema to payload if provided
+        if schema:
+            # If schema is a Pydantic model class, we need to serialize it to a schema dict
+            if isinstance(schema, type) and issubclass(schema, BaseModel):
+                payload["schema"] = schema.model_json_schema()
+            else:
+                payload["schema"] = schema
+
+            # Add a hint to the query to return in JSON format
+            payload["query"] = f"{payload['query']}\nReturn the answer in JSON format according to the required schema."
+
         response = await self._client._request("POST", "query", data=payload)
         return self._client._logic._parse_completion_response(response)
 
     async def list_documents(
-        self, skip: int = 0, limit: int = 100, filters: Optional[Dict[str, Any]] = None
+        self,
+        skip: int = 0,
+        limit: int = 100,
+        filters: Optional[Dict[str, Any]] = None,
+        additional_folders: Optional[List[str]] = None,
     ) -> List[Document]:
         """
         List accessible documents within this folder.
@@ -401,33 +424,34 @@ class AsyncFolder:
             skip: Number of documents to skip
             limit: Maximum number of documents to return
             filters: Optional filters
+            additional_folders: Optional list of additional folder names to further scope operations
 
         Returns:
             List[Document]: List of documents
         """
-        params, data = self._client._logic._prepare_list_documents_request(
-            skip, limit, filters, self._name, None
-        )
+        effective_folder = self._merge_folders(additional_folders)
+        params, data = self._client._logic._prepare_list_documents_request(skip, limit, filters, effective_folder, None)
         response = await self._client._request("POST", "documents", data=data, params=params)
         docs = self._client._logic._parse_document_list_response(response)
         for doc in docs:
             doc._client = self._client
         return docs
 
-    async def batch_get_documents(self, document_ids: List[str]) -> List[Document]:
+    async def batch_get_documents(
+        self, document_ids: List[str], additional_folders: Optional[List[str]] = None
+    ) -> List[Document]:
         """
         Retrieve multiple documents by their IDs in a single batch operation within this folder.
 
         Args:
             document_ids: List of document IDs to retrieve
+            additional_folders: Optional list of additional folder names to further scope operations
 
         Returns:
             List[Document]: List of document metadata for found documents
         """
-        # API expects a dict with document_ids key
-        request = {"document_ids": document_ids}
-        if self._name:
-            request["folder_name"] = self._name
+        merged = self._merge_folders(additional_folders)
+        request = {"document_ids": document_ids, "folder_name": merged}
         response = await self._client._request("POST", "batch/documents", data=request)
         docs = self._client._logic._parse_document_list_response(response)
         for doc in docs:
@@ -435,18 +459,24 @@ class AsyncFolder:
         return docs
 
     async def batch_get_chunks(
-        self, sources: List[Union[ChunkSource, Dict[str, Any]]]
+        self,
+        sources: List[Union[ChunkSource, Dict[str, Any]]],
+        additional_folders: Optional[List[str]] = None,
+        use_colpali: bool = True,
     ) -> List[FinalChunkResult]:
         """
         Retrieve specific chunks by their document ID and chunk number in a single batch operation within this folder.
 
         Args:
             sources: List of ChunkSource objects or dictionaries with document_id and chunk_number
+            additional_folders: Optional list of additional folder names to further scope operations
+            use_colpali: Whether to use ColPali-style embedding model
 
         Returns:
             List[FinalChunkResult]: List of chunk results
         """
-        request = self._client._logic._prepare_batch_get_chunks_request(sources, self._name, None)
+        merged = self._merge_folders(additional_folders)
+        request = self._client._logic._prepare_batch_get_chunks_request(sources, merged, None, use_colpali)
         response = await self._client._request("POST", "batch/chunks", data=request)
         return self._client._logic._parse_chunk_result_list_response(response)
 
@@ -473,7 +503,9 @@ class AsyncFolder:
             name, filters, documents, prompt_overrides, self._name, None
         )
         response = await self._client._request("POST", "graph/create", data=request)
-        return self._client._logic._parse_graph_response(response)
+        graph = self._logic._parse_graph_response(response)
+        graph._client = self  # Attach AsyncMorphik client for polling helpers
+        return graph
 
     async def update_graph(
         self,
@@ -498,7 +530,9 @@ class AsyncFolder:
             name, additional_filters, additional_documents, prompt_overrides, self._name, None
         )
         response = await self._client._request("POST", f"graph/{name}/update", data=request)
-        return self._client._logic._parse_graph_response(response)
+        graph = self._logic._parse_graph_response(response)
+        graph._client = self
+        return graph
 
     async def delete_document_by_filename(self, filename: str) -> Dict[str, str]:
         """
@@ -510,9 +544,6 @@ class AsyncFolder:
         Returns:
             Dict[str, str]: Deletion status
         """
-        # Get the document by filename with folder scope
-        request = {"filename": filename, "folder_name": self._name}
-
         # First get the document ID
         response = await self._client._request(
             "GET", f"documents/filename/{filename}", params={"folder_name": self._name}
@@ -521,6 +552,18 @@ class AsyncFolder:
 
         # Then delete by ID
         return await self._client.delete_document(doc.external_id)
+
+    # Helper --------------------------------------------------------------
+    def _merge_folders(self, additional_folders: Optional[List[str]] = None) -> Union[str, List[str]]:
+        """Return the effective folder scope for this folder instance.
+
+        If *additional_folders* is provided it will be combined with the scoped
+        folder (*self._name*) and returned as a list.  Otherwise just
+        *self._name* is returned so the API keeps backward-compatibility with
+        accepting a single string."""
+        if not additional_folders:
+            return self._name
+        return [self._name] + additional_folders
 
 
 class AsyncUserScope:
@@ -627,14 +670,14 @@ class AsyncUserScope:
             # Prepare multipart form data
             files = {"file": (filename, file_obj)}
 
-            # Add metadata and rules
+            # Add metadata, rules and scoping information
             data = {
                 "metadata": json.dumps(metadata or {}),
                 "rules": json.dumps([self._client._convert_rule(r) for r in (rules or [])]),
-                "end_user_id": self._end_user_id,  # Add end user ID here
+                "end_user_id": self._end_user_id,
+                "use_colpali": str(use_colpali).lower(),
             }
 
-            # Add folder name if scoped to a folder
             if self._folder_name:
                 data["folder_name"] = self._folder_name
 
@@ -685,9 +728,7 @@ class AsyncUserScope:
             if rules:
                 if all(isinstance(r, list) for r in rules):
                     # List of lists - per-file rules
-                    converted_rules = [
-                        [self._client._convert_rule(r) for r in rule_list] for rule_list in rules
-                    ]
+                    converted_rules = [[self._client._convert_rule(r) for r in rule_list] for rule_list in rules]
                 else:
                     # Flat list - shared rules for all files
                     converted_rules = [self._client._convert_rule(r) for r in rules]
@@ -697,9 +738,9 @@ class AsyncUserScope:
             data = {
                 "metadata": json.dumps(metadata or {}),
                 "rules": json.dumps(converted_rules),
-                "use_colpali": str(use_colpali).lower() if use_colpali is not None else None,
                 "parallel": str(parallel).lower(),
-                "end_user_id": self._end_user_id,  # Add end user ID here
+                "end_user_id": self._end_user_id,
+                "use_colpali": str(use_colpali).lower(),
             }
 
             # Add folder name if scoped to a folder
@@ -707,11 +748,10 @@ class AsyncUserScope:
                 data["folder_name"] = self._folder_name
 
             response = await self._client._request(
-                "POST", 
-                "ingest/files", 
-                data=data, 
+                "POST",
+                "ingest/files",
+                data=data,
                 files=file_objects,
-                params={"use_colpali": str(use_colpali).lower()},
             )
 
             if response.get("errors"):
@@ -719,9 +759,7 @@ class AsyncUserScope:
                 for error in response["errors"]:
                     logger.error(f"Failed to ingest {error['filename']}: {error['error']}")
 
-            docs = [
-                self._client._logic._parse_document_response(doc) for doc in response["documents"]
-            ]
+            docs = [self._client._logic._parse_document_response(doc) for doc in response["documents"]]
             for doc in docs:
                 doc._client = self._client
             return docs
@@ -784,6 +822,7 @@ class AsyncUserScope:
         k: int = 4,
         min_score: float = 0.0,
         use_colpali: bool = True,
+        additional_folders: Optional[List[str]] = None,
     ) -> List[FinalChunkResult]:
         """
         Retrieve relevant chunks as this end user.
@@ -794,12 +833,14 @@ class AsyncUserScope:
             k: Number of results (default: 4)
             min_score: Minimum similarity threshold (default: 0.0)
             use_colpali: Whether to use ColPali-style embedding model
+            additional_folders: Optional list of additional folder names to further scope operations
 
         Returns:
             List[FinalChunkResult]: List of relevant chunks
         """
+        effective_folder = self._merge_folders(additional_folders)
         payload = self._client._logic._prepare_retrieve_chunks_request(
-            query, filters, k, min_score, use_colpali, self._folder_name, self._end_user_id
+            query, filters, k, min_score, use_colpali, effective_folder, self._end_user_id
         )
         response = await self._client._request("POST", "retrieve/chunks", data=payload)
         return self._client._logic._parse_chunk_result_list_response(response)
@@ -811,6 +852,7 @@ class AsyncUserScope:
         k: int = 4,
         min_score: float = 0.0,
         use_colpali: bool = True,
+        additional_folders: Optional[List[str]] = None,
     ) -> List[DocumentResult]:
         """
         Retrieve relevant documents as this end user.
@@ -821,12 +863,14 @@ class AsyncUserScope:
             k: Number of results (default: 4)
             min_score: Minimum similarity threshold (default: 0.0)
             use_colpali: Whether to use ColPali-style embedding model
+            additional_folders: Optional list of additional folder names to further scope operations
 
         Returns:
             List[DocumentResult]: List of relevant documents
         """
+        effective_folder = self._merge_folders(additional_folders)
         payload = self._client._logic._prepare_retrieve_docs_request(
-            query, filters, k, min_score, use_colpali, self._folder_name, self._end_user_id
+            query, filters, k, min_score, use_colpali, effective_folder, self._end_user_id
         )
         response = await self._client._request("POST", "retrieve/docs", data=payload)
         return self._client._logic._parse_document_result_list_response(response)
@@ -844,9 +888,12 @@ class AsyncUserScope:
         hop_depth: int = 1,
         include_paths: bool = False,
         prompt_overrides: Optional[Union[QueryPromptOverrides, Dict[str, Any]]] = None,
+        additional_folders: Optional[List[str]] = None,
+        schema: Optional[Union[Type[BaseModel], Dict[str, Any]]] = None,
+        chat_id: Optional[str] = None,
     ) -> CompletionResponse:
         """
-        Generate completion using relevant chunks as context as this end user.
+        Generate completion using relevant chunks as context, scoped to the end user.
 
         Args:
             query: Query text
@@ -860,10 +907,13 @@ class AsyncUserScope:
             hop_depth: Number of relationship hops to traverse in the graph (1-3)
             include_paths: Whether to include relationship paths in the response
             prompt_overrides: Optional customizations for entity extraction, resolution, and query prompts
+            schema: Optional schema for structured output
+            additional_folders: Optional list of additional folder names to further scope operations
 
         Returns:
-            CompletionResponse: Generated completion
+            CompletionResponse: Generated completion or structured output
         """
+        effective_folder = self._merge_folders(additional_folders)
         payload = self._client._logic._prepare_query_request(
             query,
             filters,
@@ -876,14 +926,32 @@ class AsyncUserScope:
             hop_depth,
             include_paths,
             prompt_overrides,
-            self._folder_name,
+            effective_folder,
             self._end_user_id,
+            chat_id,
+            schema,
         )
+
+        # Add schema to payload if provided
+        if schema:
+            # If schema is a Pydantic model class, we need to serialize it to a schema dict
+            if isinstance(schema, type) and issubclass(schema, BaseModel):
+                payload["schema"] = schema.model_json_schema()
+            else:
+                payload["schema"] = schema
+
+            # Add a hint to the query to return in JSON format
+            payload["query"] = f"{payload['query']}\nReturn the answer in JSON format according to the required schema."
+
         response = await self._client._request("POST", "query", data=payload)
         return self._client._logic._parse_completion_response(response)
 
     async def list_documents(
-        self, skip: int = 0, limit: int = 100, filters: Optional[Dict[str, Any]] = None
+        self,
+        skip: int = 0,
+        limit: int = 100,
+        filters: Optional[Dict[str, Any]] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
     ) -> List[Document]:
         """
         List accessible documents for this end user.
@@ -892,12 +960,13 @@ class AsyncUserScope:
             skip: Number of documents to skip
             limit: Maximum number of documents to return
             filters: Optional filters
+            folder_name: Optional folder name (or list of names) to scope the request
 
         Returns:
             List[Document]: List of documents
         """
         params, data = self._client._logic._prepare_list_documents_request(
-            skip, limit, filters, self._folder_name, self._end_user_id
+            skip, limit, filters, folder_name, self._end_user_id
         )
         response = await self._client._request("POST", "documents", data=data, params=params)
         docs = self._client._logic._parse_document_list_response(response)
@@ -905,12 +974,15 @@ class AsyncUserScope:
             doc._client = self._client
         return docs
 
-    async def batch_get_documents(self, document_ids: List[str]) -> List[Document]:
+    async def batch_get_documents(
+        self, document_ids: List[str], folder_name: Optional[Union[str, List[str]]] = None
+    ) -> List[Document]:
         """
         Retrieve multiple documents by their IDs in a single batch operation for this end user.
 
         Args:
             document_ids: List of document IDs to retrieve
+            folder_name: Optional folder name (or list of names) to scope the request
 
         Returns:
             List[Document]: List of document metadata for found documents
@@ -928,19 +1000,24 @@ class AsyncUserScope:
         return docs
 
     async def batch_get_chunks(
-        self, sources: List[Union[ChunkSource, Dict[str, Any]]]
+        self,
+        sources: List[Union[ChunkSource, Dict[str, Any]]],
+        folder_name: Optional[Union[str, List[str]]] = None,
+        use_colpali: bool = True,
     ) -> List[FinalChunkResult]:
         """
         Retrieve specific chunks by their document ID and chunk number in a single batch operation for this end user.
 
         Args:
             sources: List of ChunkSource objects or dictionaries with document_id and chunk_number
+            folder_name: Optional folder name (or list of names) to scope the request
+            use_colpali: Whether to use ColPali-style embedding model
 
         Returns:
             List[FinalChunkResult]: List of chunk results
         """
         request = self._client._logic._prepare_batch_get_chunks_request(
-            sources, self._folder_name, self._end_user_id
+            sources, self._folder_name, self._end_user_id, use_colpali
         )
         response = await self._client._request("POST", "batch/chunks", data=request)
         return self._client._logic._parse_chunk_result_list_response(response)
@@ -968,7 +1045,9 @@ class AsyncUserScope:
             name, filters, documents, prompt_overrides, self._folder_name, self._end_user_id
         )
         response = await self._client._request("POST", "graph/create", data=request)
-        return self._client._logic._parse_graph_response(response)
+        graph = self._logic._parse_graph_response(response)
+        graph._client = self
+        return graph
 
     async def update_graph(
         self,
@@ -998,7 +1077,9 @@ class AsyncUserScope:
             self._end_user_id,
         )
         response = await self._client._request("POST", f"graph/{name}/update", data=request)
-        return self._client._logic._parse_graph_response(response)
+        graph = self._logic._parse_graph_response(response)
+        graph._client = self
+        return graph
 
     async def delete_document_by_filename(self, filename: str) -> Dict[str, str]:
         """
@@ -1018,9 +1099,7 @@ class AsyncUserScope:
             params["folder_name"] = self._folder_name
 
         # First get the document ID
-        response = await self._client._request(
-            "GET", f"documents/filename/{filename}", params=params
-        )
+        response = await self._client._request("GET", f"documents/filename/{filename}", params=params)
         doc = self._client._logic._parse_document_response(response)
 
         # Then delete by ID
@@ -1077,7 +1156,7 @@ class AsyncMorphik:
             # Remove Content-Type if it exists - httpx will set the correct multipart boundary
             if "Content-Type" in headers:
                 del headers["Content-Type"]
-                
+
             # For file uploads with form data, use form data (not json)
             request_data = {"files": files}
             if data:
@@ -1112,18 +1191,16 @@ class AsyncMorphik:
         Returns:
             AsyncFolder: A folder object ready for scoped operations
         """
-        payload = {
-            "name": name
-        }
+        payload = {"name": name}
         if description:
             payload["description"] = description
-            
+
         response = await self._request("POST", "folders", data=payload)
         folder_info = FolderInfo(**response)
-        
+
         # Return a usable AsyncFolder object with the ID from the response
         return AsyncFolder(self, name, folder_id=folder_info.id)
-    
+
     def get_folder_by_name(self, name: str) -> AsyncFolder:
         """
         Get a folder by name to scope operations.
@@ -1135,7 +1212,7 @@ class AsyncMorphik:
             AsyncFolder: A folder object for scoped operations
         """
         return AsyncFolder(self, name)
-        
+
     async def get_folder(self, folder_id: str) -> AsyncFolder:
         """
         Get a folder by ID.
@@ -1148,7 +1225,7 @@ class AsyncMorphik:
         """
         response = await self._request("GET", f"folders/{folder_id}")
         return AsyncFolder(self, response["name"], folder_id)
-        
+
     async def list_folders(self) -> List[AsyncFolder]:
         """
         List all folders the user has access to as AsyncFolder objects.
@@ -1158,7 +1235,7 @@ class AsyncMorphik:
         """
         response = await self._request("GET", "folders")
         return [AsyncFolder(self, folder["name"], folder["id"]) for folder in response]
-        
+
     async def add_document_to_folder(self, folder_id: str, document_id: str) -> Dict[str, str]:
         """
         Add a document to a folder.
@@ -1172,7 +1249,7 @@ class AsyncMorphik:
         """
         response = await self._request("POST", f"folders/{folder_id}/documents/{document_id}")
         return response
-        
+
     async def remove_document_from_folder(self, folder_id: str, document_id: str) -> Dict[str, str]:
         """
         Remove a document from a folder.
@@ -1216,7 +1293,8 @@ class AsyncMorphik:
             rules: Optional list of rules to apply during ingestion. Can be:
                   - MetadataExtractionRule: Extract metadata using a schema
                   - NaturalLanguageRule: Transform content using natural language
-            use_colpali: Whether to use ColPali-style embedding model to ingest the text (slower, but significantly better retrieval accuracy for text and images)
+            use_colpali: Whether to use ColPali-style embedding model to ingest the text
+                (slower, but significantly better retrieval accuracy for text and images)
         Returns:
             Document: Metadata of the ingested document
 
@@ -1268,14 +1346,13 @@ class AsyncMorphik:
             files = {"file": (filename, file_obj)}
 
             # Create form data
-            form_data = self._logic._prepare_ingest_file_form_data(metadata, rules, None, None)
+            form_data = self._logic._prepare_ingest_file_form_data(metadata, rules, None, None, use_colpali)
 
             response = await self._request(
                 "POST",
                 "ingest/file",
                 data=form_data,
                 files=files,
-                params={"use_colpali": str(use_colpali).lower()},
             )
             doc = self._logic._parse_document_response(response)
             doc._client = self
@@ -1314,16 +1391,13 @@ class AsyncMorphik:
 
         try:
             # Prepare form data
-            data = self._logic._prepare_ingest_files_form_data(
-                metadata, rules, use_colpali, parallel, None, None
-            )
+            data = self._logic._prepare_ingest_files_form_data(metadata, rules, use_colpali, parallel, None, None)
 
             response = await self._request(
-                "POST", 
-                "ingest/files", 
-                data=data, 
+                "POST",
+                "ingest/files",
+                data=data,
                 files=file_objects,
-                params={"use_colpali": str(use_colpali).lower()},
             )
 
             if response.get("errors"):
@@ -1398,6 +1472,7 @@ class AsyncMorphik:
         k: int = 4,
         min_score: float = 0.0,
         use_colpali: bool = True,
+        folder_name: Optional[Union[str, List[str]]] = None,
     ) -> List[FinalChunkResult]:
         """
         Search for relevant chunks.
@@ -1407,7 +1482,8 @@ class AsyncMorphik:
             filters: Optional metadata filters
             k: Number of results (default: 4)
             min_score: Minimum similarity threshold (default: 0.0)
-            use_colpali: Whether to use ColPali-style embedding model to retrieve chunks (only works for documents ingested with `use_colpali=True`)
+            use_colpali: Whether to use ColPali-style embedding model to retrieve chunks
+                (only works for documents ingested with `use_colpali=True`)
         Returns:
             List[FinalChunkResult]
 
@@ -1419,8 +1495,9 @@ class AsyncMorphik:
             )
             ```
         """
+        effective_folder = folder_name if folder_name is not None else None
         payload = self._logic._prepare_retrieve_chunks_request(
-            query, filters, k, min_score, use_colpali, None, None
+            query, filters, k, min_score, use_colpali, effective_folder, None
         )
         response = await self._request("POST", "retrieve/chunks", data=payload)
         return self._logic._parse_chunk_result_list_response(response)
@@ -1432,6 +1509,7 @@ class AsyncMorphik:
         k: int = 4,
         min_score: float = 0.0,
         use_colpali: bool = True,
+        folder_name: Optional[Union[str, List[str]]] = None,
     ) -> List[DocumentResult]:
         """
         Retrieve relevant documents.
@@ -1441,7 +1519,8 @@ class AsyncMorphik:
             filters: Optional metadata filters
             k: Number of results (default: 4)
             min_score: Minimum similarity threshold (default: 0.0)
-            use_colpali: Whether to use ColPali-style embedding model to retrieve documents (only works for documents ingested with `use_colpali=True`)
+            use_colpali: Whether to use ColPali-style embedding model to retrieve documents
+                (only works for documents ingested with `use_colpali=True`)
         Returns:
             List[DocumentResult]
 
@@ -1453,8 +1532,9 @@ class AsyncMorphik:
             )
             ```
         """
+        effective_folder = folder_name if folder_name is not None else None
         payload = self._logic._prepare_retrieve_docs_request(
-            query, filters, k, min_score, use_colpali, None, None
+            query, filters, k, min_score, use_colpali, effective_folder, None
         )
         response = await self._request("POST", "retrieve/docs", data=payload)
         return self._logic._parse_document_result_list_response(response)
@@ -1472,6 +1552,9 @@ class AsyncMorphik:
         hop_depth: int = 1,
         include_paths: bool = False,
         prompt_overrides: Optional[Union[QueryPromptOverrides, Dict[str, Any]]] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
+        chat_id: Optional[str] = None,
+        schema: Optional[Union[Type[BaseModel], Dict[str, Any]]] = None,
     ) -> CompletionResponse:
         """
         Generate completion using relevant chunks as context.
@@ -1483,12 +1566,14 @@ class AsyncMorphik:
             min_score: Minimum similarity threshold (default: 0.0)
             max_tokens: Maximum tokens in completion
             temperature: Model temperature
-            use_colpali: Whether to use ColPali-style embedding model to generate the completion (only works for documents ingested with `use_colpali=True`)
+            use_colpali: Whether to use ColPali-style embedding model to generate the completion
+                (only works for documents ingested with `use_colpali=True`)
             graph_name: Optional name of the graph to use for knowledge graph-enhanced retrieval
             hop_depth: Number of relationship hops to traverse in the graph (1-3)
             include_paths: Whether to include relationship paths in the response
             prompt_overrides: Optional customizations for entity extraction, resolution, and query prompts
                 Either a QueryPromptOverrides object or a dictionary with the same structure
+            schema: Optional schema for structured output, can be a Pydantic model or a JSON schema dict
         Returns:
             CompletionResponse
 
@@ -1536,8 +1621,30 @@ class AsyncMorphik:
             if response.metadata and "graph" in response.metadata:
                 for path in response.metadata["graph"]["paths"]:
                     print(" -> ".join(path))
+
+            # Using structured output with a Pydantic model
+            from pydantic import BaseModel
+
+            class ResearchFindings(BaseModel):
+                main_finding: str
+                supporting_evidence: List[str]
+                limitations: List[str]
+
+            response = await db.query(
+                "Summarize the key research findings from these documents",
+                schema=ResearchFindings
+            )
+
+            # Access structured output
+            if response.structured_output:
+                findings = response.structured_output
+                print(f"Main finding: {findings.main_finding}")
+                print("Supporting evidence:")
+                for evidence in findings.supporting_evidence:
+                    print(f"- {evidence}")
             ```
         """
+        effective_folder = folder_name if folder_name is not None else None
         payload = self._logic._prepare_query_request(
             query,
             filters,
@@ -1550,14 +1657,71 @@ class AsyncMorphik:
             hop_depth,
             include_paths,
             prompt_overrides,
+            effective_folder,
             None,
-            None,
+            chat_id,
+            schema,
         )
+
+        # Add schema to payload if provided
+        if schema:
+            # If schema is a Pydantic model class, we need to serialize it to a schema dict
+            if isinstance(schema, type) and issubclass(schema, BaseModel):
+                payload["schema"] = schema.model_json_schema()
+            else:
+                payload["schema"] = schema
+
+            # Add a hint to the query to return in JSON format
+            payload["query"] = f"{payload['query']}\nReturn the answer in JSON format according to the required schema."
+
         response = await self._request("POST", "query", data=payload)
         return self._logic._parse_completion_response(response)
 
+    async def agent_query(self, query: str) -> Dict[str, Any]:
+        """
+        Execute an agentic query with tool access and conversation handling.
+
+        The agent can autonomously use various tools to answer complex queries including:
+        - Searching and retrieving relevant documents
+        - Analyzing document content 
+        - Performing calculations and data processing
+        - Creating summaries and reports
+        - Managing knowledge graphs
+
+        Args:
+            query: Natural language query for the Morphik agent
+
+        Returns:
+            Dict[str, Any]: Agent response with potential tool execution results and sources
+
+        Example:
+            ```python
+            # Simple query
+            result = await db.agent_query("What are the main trends in our Q3 sales data?")
+            print(result["response"])
+
+            # Complex analysis request
+            result = await db.agent_query(
+                "Analyze all documents from the marketing department, "
+                "identify key performance metrics, and create a summary "
+                "with actionable insights"
+            )
+            print(result["response"])
+
+            # Tool usage is automatic - the agent will decide which tools to use
+            # based on the query requirements
+            ```
+        """
+        request = {"query": query}
+        response = await self._request("POST", "agent", data=request)
+        return response
+
     async def list_documents(
-        self, skip: int = 0, limit: int = 100, filters: Optional[Dict[str, Any]] = None
+        self,
+        skip: int = 0,
+        limit: int = 100,
+        filters: Optional[Dict[str, Any]] = None,
+        folder_name: Optional[Union[str, List[str]]] = None,
     ) -> List[Document]:
         """
         List accessible documents.
@@ -1566,6 +1730,7 @@ class AsyncMorphik:
             skip: Number of documents to skip
             limit: Maximum number of documents to return
             filters: Optional filters
+            folder_name: Optional folder name (or list of names) to scope the request
 
         Returns:
             List[Document]: List of accessible documents
@@ -1579,7 +1744,7 @@ class AsyncMorphik:
             next_page = await db.list_documents(skip=10, limit=10, filters={"department": "research"})
             ```
         """
-        params, data = self._logic._prepare_list_documents_request(skip, limit, filters, None, None)
+        params, data = self._logic._prepare_list_documents_request(skip, limit, filters, folder_name, None)
         response = await self._request("POST", "documents", data=data, params=params)
         docs = self._logic._parse_document_list_response(response)
         for doc in docs:
@@ -1606,17 +1771,17 @@ class AsyncMorphik:
         doc = self._logic._parse_document_response(response)
         doc._client = self
         return doc
-        
+
     async def get_document_status(self, document_id: str) -> Dict[str, Any]:
         """
         Get the current processing status of a document.
-        
+
         Args:
             document_id: ID of the document to check
-            
+
         Returns:
             Dict[str, Any]: Status information including current status, potential errors, and other metadata
-            
+
         Example:
             ```python
             status = await db.get_document_status("doc_123")
@@ -1630,23 +1795,25 @@ class AsyncMorphik:
         """
         response = await self._request("GET", f"documents/{document_id}/status")
         return response
-    
-    async def wait_for_document_completion(self, document_id: str, timeout_seconds=300, check_interval_seconds=2) -> Document:
+
+    async def wait_for_document_completion(
+        self, document_id: str, timeout_seconds=300, check_interval_seconds=2
+    ) -> Document:
         """
         Wait for a document's processing to complete.
-        
+
         Args:
             document_id: ID of the document to wait for
             timeout_seconds: Maximum time to wait for completion (default: 300 seconds)
             check_interval_seconds: Time between status checks (default: 2 seconds)
-            
+
         Returns:
             Document: Updated document with the latest status
-            
+
         Raises:
             TimeoutError: If processing doesn't complete within the timeout period
             ValueError: If processing fails with an error
-            
+
         Example:
             ```python
             # Upload a file and wait for processing to complete
@@ -1661,20 +1828,21 @@ class AsyncMorphik:
             ```
         """
         import asyncio
+
         start_time = asyncio.get_event_loop().time()
-        
+
         while (asyncio.get_event_loop().time() - start_time) < timeout_seconds:
             status = await self.get_document_status(document_id)
-            
+
             if status["status"] == "completed":
                 # Get the full document now that it's complete
                 return await self.get_document(document_id)
             elif status["status"] == "failed":
                 raise ValueError(f"Document processing failed: {status.get('error', 'Unknown error')}")
-            
+
             # Wait before checking again
             await asyncio.sleep(check_interval_seconds)
-        
+
         raise TimeoutError(f"Document processing did not complete within {timeout_seconds} seconds")
 
     async def get_document_by_filename(self, filename: str) -> Document:
@@ -1828,9 +1996,7 @@ class AsyncMorphik:
                 form_data["use_colpali"] = str(use_colpali).lower()
 
             # Use the dedicated file update endpoint
-            response = await self._request(
-                "POST", f"documents/{document_id}/update_file", data=form_data, files=files
-            )
+            response = await self._request("POST", f"documents/{document_id}/update_file", data=form_data, files=files)
 
             doc = self._logic._parse_document_response(response)
             doc._client = self
@@ -1866,9 +2032,7 @@ class AsyncMorphik:
             ```
         """
         # Use the dedicated metadata update endpoint
-        response = await self._request(
-            "POST", f"documents/{document_id}/update_metadata", data=metadata
-        )
+        response = await self._request("POST", f"documents/{document_id}/update_metadata", data=metadata)
         doc = self._logic._parse_document_response(response)
         doc._client = self
         return doc
@@ -2034,12 +2198,15 @@ class AsyncMorphik:
 
         return result
 
-    async def batch_get_documents(self, document_ids: List[str]) -> List[Document]:
+    async def batch_get_documents(
+        self, document_ids: List[str], folder_name: Optional[Union[str, List[str]]] = None
+    ) -> List[Document]:
         """
         Retrieve multiple documents by their IDs in a single batch operation.
 
         Args:
             document_ids: List of document IDs to retrieve
+            folder_name: Optional folder name (or list of names) to scope the request
 
         Returns:
             List[Document]: List of document metadata for found documents
@@ -2053,6 +2220,8 @@ class AsyncMorphik:
         """
         # API expects a dict with document_ids key, not a direct list
         request = {"document_ids": document_ids}
+        if folder_name:
+            request["folder_name"] = folder_name
         response = await self._request("POST", "batch/documents", data=request)
         docs = self._logic._parse_document_list_response(response)
         for doc in docs:
@@ -2060,13 +2229,18 @@ class AsyncMorphik:
         return docs
 
     async def batch_get_chunks(
-        self, sources: List[Union[ChunkSource, Dict[str, Any]]]
+        self,
+        sources: List[Union[ChunkSource, Dict[str, Any]]],
+        folder_name: Optional[Union[str, List[str]]] = None,
+        use_colpali: bool = True,
     ) -> List[FinalChunkResult]:
         """
         Retrieve specific chunks by their document ID and chunk number in a single batch operation.
 
         Args:
             sources: List of ChunkSource objects or dictionaries with document_id and chunk_number
+            folder_name: Optional folder name (or list of names) to scope the request
+            use_colpali: Whether to use ColPali-style embedding model
 
         Returns:
             List[FinalChunkResult]: List of chunk results
@@ -2091,7 +2265,7 @@ class AsyncMorphik:
                 print(f"Chunk from {chunk.document_id}, number {chunk.chunk_number}: {chunk.content[:50]}...")
             ```
         """
-        request = self._logic._prepare_batch_get_chunks_request(sources, None, None)
+        request = self._logic._prepare_batch_get_chunks_request(sources, folder_name, None, use_colpali)
         response = await self._request("POST", "batch/chunks", data=request)
         return self._logic._parse_chunk_result_list_response(response)
 
@@ -2110,8 +2284,10 @@ class AsyncMorphik:
             name: Name of the cache to create
             model: Name of the model to use (e.g. "llama2")
             gguf_file: Name of the GGUF file to use for the model
-            filters: Optional metadata filters to determine which documents to include. These filters will be applied in addition to any specific docs provided.
-            docs: Optional list of specific document IDs to include. These docs will be included in addition to any documents matching the filters.
+            filters: Optional metadata filters to determine which documents to include.
+                These filters will be applied in addition to any specific docs provided.
+            docs: Optional list of specific document IDs to include.
+                These docs will be included in addition to any documents matching the filters.
 
         Returns:
             Dict[str, Any]: Created cache configuration
@@ -2212,11 +2388,11 @@ class AsyncMorphik:
             )
             ```
         """
-        request = self._logic._prepare_create_graph_request(
-            name, filters, documents, prompt_overrides, None, None
-        )
+        request = self._logic._prepare_create_graph_request(name, filters, documents, prompt_overrides, None, None)
         response = await self._request("POST", "graph/create", data=request)
-        return self._logic._parse_graph_response(response)
+        graph = self._logic._parse_graph_response(response)
+        graph._client = self  # Attach AsyncMorphik client for polling helpers
+        return graph
 
     async def get_graph(self, name: str) -> Graph:
         """
@@ -2236,7 +2412,9 @@ class AsyncMorphik:
             ```
         """
         response = await self._request("GET", f"graph/{name}")
-        return self._logic._parse_graph_response(response)
+        graph = self._logic._parse_graph_response(response)
+        graph._client = self
+        return graph
 
     async def list_graphs(self) -> List[Graph]:
         """
@@ -2254,7 +2432,10 @@ class AsyncMorphik:
             ```
         """
         response = await self._request("GET", "graphs")
-        return self._logic._parse_graph_list_response(response)
+        graphs = self._logic._parse_graph_list_response(response)
+        for g in graphs:
+            g._client = self
+        return graphs
 
     async def update_graph(
         self,
@@ -2311,7 +2492,9 @@ class AsyncMorphik:
             name, additional_filters, additional_documents, prompt_overrides, None, None
         )
         response = await self._request("POST", f"graph/{name}/update", data=request)
-        return self._logic._parse_graph_response(response)
+        graph = self._logic._parse_graph_response(response)
+        graph._client = self
+        return graph
 
     async def delete_document(self, document_id: str) -> Dict[str, str]:
         """
@@ -2373,3 +2556,37 @@ class AsyncMorphik:
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
+
+    async def create_app(self, app_id: str, name: str, expiry_days: int = 30) -> Dict[str, str]:
+        """Create a new application in Morphik Cloud and obtain its auth URI (async)."""
+
+        payload = {"app_id": app_id, "name": name, "expiry_days": expiry_days}
+        return await self._request("POST", "ee/create_app", data=payload)
+
+    async def wait_for_graph_completion(
+        self,
+        graph_name: str,
+        timeout_seconds: int = 300,
+        check_interval_seconds: int = 5,
+    ) -> Graph:
+        """Block until the specified graph finishes processing (async).
+
+        Args:
+            graph_name: Name of the graph to monitor.
+            timeout_seconds: Maximum seconds to wait.
+            check_interval_seconds: Seconds between status checks.
+
+        Returns:
+            Graph: The completed graph object.
+        """
+        import asyncio
+
+        start = asyncio.get_event_loop().time()
+        while (asyncio.get_event_loop().time() - start) < timeout_seconds:
+            graph = await self.get_graph(graph_name)
+            if graph.is_completed:
+                return graph
+            if graph.is_failed:
+                raise RuntimeError(graph.error or "Graph processing failed")
+            await asyncio.sleep(check_interval_seconds)
+        raise TimeoutError("Timed out waiting for graph completion")

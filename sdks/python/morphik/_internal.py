@@ -1,26 +1,25 @@
 import base64
 import io
 import json
-from io import BytesIO, IOBase
-from PIL import Image
-from PIL.Image import Image as PILImage
+from io import BytesIO
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Union, Tuple, BinaryIO
+from typing import Any, BinaryIO, Dict, List, Optional, Tuple, Type, Union
 from urllib.parse import urlparse
 
 import jwt
+from PIL import Image
+from PIL.Image import Image as PILImage
 from pydantic import BaseModel, Field
 
+from .models import ChunkSource  # Prompt override models
 from .models import (
-    Document,
     ChunkResult,
-    DocumentResult,
     CompletionResponse,
-    IngestTextRequest,
-    ChunkSource,
+    Document,
+    DocumentResult,
     Graph,
-    # Prompt override models
     GraphPromptOverrides,
+    IngestTextRequest,
 )
 from .rules import Rule
 
@@ -173,8 +172,14 @@ class _MorphikClientLogic:
         rules: Optional[List[RuleOrDict]],
         folder_name: Optional[str],
         end_user_id: Optional[str],
+        use_colpali: Optional[bool] = None,
     ) -> Dict[str, Any]:
-        """Prepare form data for ingest_file endpoint"""
+        """Prepare form data for ingest_file endpoint.
+
+        All parameters are included in the multipart body so that the server
+        never relies on query-string values.  *use_colpali* is therefore always
+        embedded here when provided.
+        """
         form_data = {
             "metadata": json.dumps(metadata or {}),
             "rules": json.dumps([self._convert_rule(r) for r in (rules or [])]),
@@ -183,6 +188,12 @@ class _MorphikClientLogic:
             form_data["folder_name"] = folder_name
         if end_user_id:
             form_data["end_user_id"] = end_user_id
+
+        # Only include the flag when caller supplied a specific value to avoid
+        # overriding server defaults unintentionally.
+        if use_colpali is not None:
+            form_data["use_colpali"] = str(use_colpali).lower()
+
         return form_data
 
     def _prepare_ingest_files_form_data(
@@ -199,9 +210,7 @@ class _MorphikClientLogic:
         if rules:
             if all(isinstance(r, list) for r in rules):
                 # List of lists - per-file rules
-                converted_rules = [
-                    [self._convert_rule(r) for r in rule_list] for rule_list in rules
-                ]
+                converted_rules = [[self._convert_rule(r) for r in rule_list] for rule_list in rules]
             else:
                 # Flat list - shared rules for all files
                 converted_rules = [self._convert_rule(r) for r in rules]
@@ -211,9 +220,14 @@ class _MorphikClientLogic:
         data = {
             "metadata": json.dumps(metadata or {}),
             "rules": json.dumps(converted_rules),
-            # use_colpali is a query parameter, not a form field
             "parallel": str(parallel).lower(),
         }
+
+        # Always carry use_colpali in the body for consistency with single-file
+        # ingestion.  The API treats missing values as "true" for backward
+        # compatibility, hence we only add it when explicitly provided.
+        if use_colpali is not None:
+            data["use_colpali"] = str(use_colpali).lower()
 
         if folder_name:
             data["folder_name"] = folder_name
@@ -235,8 +249,10 @@ class _MorphikClientLogic:
         hop_depth: int,
         include_paths: bool,
         prompt_overrides: Optional[Dict],
-        folder_name: Optional[str],
+        folder_name: Optional[Union[str, List[str]]],
         end_user_id: Optional[str],
+        chat_id: Optional[str] = None,
+        schema: Optional[Union[Type[BaseModel], Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Prepare request for query endpoint"""
         payload = {
@@ -256,6 +272,22 @@ class _MorphikClientLogic:
             payload["folder_name"] = folder_name
         if end_user_id:
             payload["end_user_id"] = end_user_id
+        if chat_id:
+            payload["chat_id"] = chat_id
+
+        # Add schema to payload if provided
+        if schema:
+            # If schema is a Pydantic model class, serialize it to a JSON schema dict
+            if isinstance(schema, type) and issubclass(schema, BaseModel):
+                payload["schema"] = schema.model_json_schema()
+            elif isinstance(schema, dict):
+                # Basic check if it looks like a JSON schema (has 'properties' or 'type')
+                if "properties" not in schema and "type" not in schema:
+                    raise ValueError("Provided schema dictionary does not look like a valid JSON schema")
+                payload["schema"] = schema
+            else:
+                raise TypeError("schema must be a Pydantic model type or a dictionary representing a JSON schema")
+
         # Filter out None values before sending
         return {k_p: v_p for k_p, v_p in payload.items() if v_p is not None}
 
@@ -266,7 +298,7 @@ class _MorphikClientLogic:
         k: int,
         min_score: float,
         use_colpali: bool,
-        folder_name: Optional[str],
+        folder_name: Optional[Union[str, List[str]]],
         end_user_id: Optional[str],
     ) -> Dict[str, Any]:
         """Prepare request for retrieve_chunks endpoint"""
@@ -290,7 +322,7 @@ class _MorphikClientLogic:
         k: int,
         min_score: float,
         use_colpali: bool,
-        folder_name: Optional[str],
+        folder_name: Optional[Union[str, List[str]]],
         end_user_id: Optional[str],
     ) -> Dict[str, Any]:
         """Prepare request for retrieve_docs endpoint"""
@@ -312,7 +344,7 @@ class _MorphikClientLogic:
         skip: int,
         limit: int,
         filters: Optional[Dict[str, Any]],
-        folder_name: Optional[str],
+        folder_name: Optional[Union[str, List[str]]],
         end_user_id: Optional[str],
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Prepare request for list_documents endpoint"""
@@ -328,7 +360,7 @@ class _MorphikClientLogic:
         return params, data
 
     def _prepare_batch_get_documents_request(
-        self, document_ids: List[str], folder_name: Optional[str], end_user_id: Optional[str]
+        self, document_ids: List[str], folder_name: Optional[Union[str, List[str]]], end_user_id: Optional[str]
     ) -> Dict[str, Any]:
         """Prepare request for batch_get_documents endpoint"""
         if folder_name or end_user_id:
@@ -343,8 +375,9 @@ class _MorphikClientLogic:
     def _prepare_batch_get_chunks_request(
         self,
         sources: List[Union[ChunkSource, Dict[str, Any]]],
-        folder_name: Optional[str],
+        folder_name: Optional[Union[str, List[str]]],
         end_user_id: Optional[str],
+        use_colpali: bool = True,
     ) -> Dict[str, Any]:
         """Prepare request for batch_get_chunks endpoint"""
         source_dicts = []
@@ -354,14 +387,14 @@ class _MorphikClientLogic:
             else:
                 source_dicts.append(source.model_dump())
 
-        if folder_name or end_user_id:
-            request = {"sources": source_dicts}
-            if folder_name:
-                request["folder_name"] = folder_name
-            if end_user_id:
-                request["end_user_id"] = end_user_id
-            return request
-        return source_dicts  # Return just sources list if no scoping is needed
+        # Always include use_colpali flag so the server can decide how to
+        # enrich chunks.  Keep any additional scoping parameters.
+        request: Dict[str, Any] = {"sources": source_dicts, "use_colpali": use_colpali}
+        if folder_name:
+            request["folder_name"] = folder_name
+        if end_user_id:
+            request["end_user_id"] = end_user_id
+        return request
 
     def _prepare_create_graph_request(
         self,
@@ -369,7 +402,7 @@ class _MorphikClientLogic:
         filters: Optional[Dict[str, Any]],
         documents: Optional[List[str]],
         prompt_overrides: Optional[Union[GraphPromptOverrides, Dict[str, Any]]],
-        folder_name: Optional[str],
+        folder_name: Optional[Union[str, List[str]]],
         end_user_id: Optional[str],
     ) -> Dict[str, Any]:
         """Prepare request for create_graph endpoint"""
@@ -395,7 +428,7 @@ class _MorphikClientLogic:
         additional_filters: Optional[Dict[str, Any]],
         additional_documents: Optional[List[str]],
         prompt_overrides: Optional[Union[GraphPromptOverrides, Dict[str, Any]]],
-        folder_name: Optional[str],
+        folder_name: Optional[Union[str, List[str]]],
         end_user_id: Optional[str],
     ) -> Dict[str, Any]:
         """Prepare request for update_graph endpoint"""
@@ -454,15 +487,11 @@ class _MorphikClientLogic:
         docs = [Document(**doc) for doc in response_json]
         return docs
 
-    def _parse_document_result_list_response(
-        self, response_json: List[Dict[str, Any]]
-    ) -> List[DocumentResult]:
+    def _parse_document_result_list_response(self, response_json: List[Dict[str, Any]]) -> List[DocumentResult]:
         """Parse document result list response"""
         return [DocumentResult(**r) for r in response_json]
 
-    def _parse_chunk_result_list_response(
-        self, response_json: List[Dict[str, Any]]
-    ) -> List[FinalChunkResult]:
+    def _parse_chunk_result_list_response(self, response_json: List[Dict[str, Any]]) -> List[FinalChunkResult]:
         """Parse chunk result list response"""
         chunks = [ChunkResult(**r) for r in response_json]
 

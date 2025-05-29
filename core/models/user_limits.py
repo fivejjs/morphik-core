@@ -1,5 +1,6 @@
-from typing import Dict, Any, Optional
-from datetime import datetime, UTC
+from datetime import UTC, datetime
+from typing import Any, Dict, Optional
+
 from pydantic import BaseModel, Field
 
 from .tiers import AccountTier
@@ -20,13 +21,8 @@ class UserUsage(BaseModel):
     monthly_query_count: int = 0
     monthly_query_reset: Optional[datetime] = None
 
-    # Ingest usage - hourly
-    hourly_ingest_count: int = 0
-    hourly_ingest_reset: Optional[datetime] = None
-
-    # Ingest usage - monthly
-    monthly_ingest_count: int = 0
-    monthly_ingest_reset: Optional[datetime] = None
+    # Ingest usage - lifetime (no reset)
+    ingest_count: int = 0
 
     # Graph usage
     graph_count: int = 0

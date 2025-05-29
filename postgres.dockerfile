@@ -16,10 +16,9 @@ RUN git clone --branch v0.5.1 https://github.com/pgvector/pgvector.git \
 
 # Cleanup
 RUN apk del git build-base clang llvm postgresql-dev \
-    && rm -rf /pgvector 
-
-# Copy initialization scripts
-COPY init.sql /docker-entrypoint-initdb.d/
+    && rm -rf /pgvector
 
 # Copy data dump
 COPY dump.sql /tmp/dump.sql
+
+# (No database init script necessary — schema is created by the application at runtime)

@@ -1,12 +1,18 @@
-from typing import List, Optional, Tuple, Union, ContextManager
+import asyncio
+import json
 import logging
-import torch
-import numpy as np
 import time
 from contextlib import contextmanager
+from typing import List, Optional, Tuple, Union
+
+import numpy as np
 import psycopg
+import torch
 from pgvector.psycopg import Bit, register_vector
+from psycopg_pool import ConnectionPool
+
 from core.models.chunk import DocumentChunk
+
 from .base_vector_store import BaseVectorStore
 
 logger = logging.getLogger(__name__)
@@ -32,48 +38,55 @@ class MultiVectorStore(BaseVectorStore):
         if uri.startswith("postgresql+asyncpg://"):
             uri = uri.replace("postgresql+asyncpg://", "postgresql://")
         self.uri = uri
-        self.conn = None
+        # Shared connection pool – re-uses sockets across jobs, avoids TLS
+        # handshakes and auth for every INSERT call.  A small pool is enough
+        # because inserts are short-lived.
+        self.pool: ConnectionPool = ConnectionPool(conninfo=self.uri, min_size=1, max_size=10, timeout=60)
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         # Don't initialize here - initialization will be handled separately
-        
+
     @contextmanager
     def get_connection(self):
         """Get a PostgreSQL connection with retry logic.
-        
+
         Yields:
             A PostgreSQL connection object
-            
+
         Raises:
             psycopg.OperationalError: If all connection attempts fail
         """
         attempt = 0
         last_error = None
-        
+
         # Try to establish a new connection with retries
         while attempt < self.max_retries:
             try:
-                # Always create a fresh connection for critical operations
-                conn = psycopg.connect(self.uri, autocommit=True)
-                # Register vector extension on every new connection
-                register_vector(conn)
-                
+                # Borrow a pooled connection (blocking wait). Autocommit stays
+                # disabled so we can batch-commit.
+                conn = self.pool.getconn()
+
                 try:
                     yield conn
                     return
                 finally:
-                    # Always close connections after use
+                    # Release connection back to the pool
                     try:
-                        conn.close()
+                        self.pool.putconn(conn)
                     except Exception:
-                        pass
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
             except psycopg.OperationalError as e:
                 last_error = e
                 attempt += 1
                 if attempt < self.max_retries:
-                    logger.warning(f"Connection attempt {attempt} failed: {str(e)}. Retrying in {self.retry_delay} seconds...")
+                    logger.warning(
+                        f"Connection attempt {attempt} failed: {str(e)}. Retrying in {self.retry_delay} seconds..."
+                    )
                     time.sleep(self.retry_delay)
-        
+
         # If we get here, all retries failed
         logger.error(f"All connection attempts failed after {self.max_retries} retries: {str(last_error)}")
         raise last_error
@@ -92,7 +105,7 @@ class MultiVectorStore(BaseVectorStore):
                 check_table = conn.execute(
                     """
                     SELECT EXISTS (
-                        SELECT FROM information_schema.tables 
+                        SELECT FROM information_schema.tables
                         WHERE table_name = 'multi_vector_embeddings'
                     );
                 """
@@ -103,7 +116,7 @@ class MultiVectorStore(BaseVectorStore):
                     has_document_id = conn.execute(
                         """
                         SELECT EXISTS (
-                            SELECT FROM information_schema.columns 
+                            SELECT FROM information_schema.columns
                             WHERE table_name = 'multi_vector_embeddings' AND column_name = 'document_id'
                         );
                     """
@@ -114,7 +127,7 @@ class MultiVectorStore(BaseVectorStore):
                         logger.info("Updating multi_vector_embeddings table with required columns")
                         conn.execute(
                             """
-                            ALTER TABLE multi_vector_embeddings 
+                            ALTER TABLE multi_vector_embeddings
                             ADD COLUMN document_id TEXT,
                             ADD COLUMN chunk_number INTEGER,
                             ADD COLUMN content TEXT,
@@ -123,7 +136,7 @@ class MultiVectorStore(BaseVectorStore):
                         )
                         conn.execute(
                             """
-                            ALTER TABLE multi_vector_embeddings 
+                            ALTER TABLE multi_vector_embeddings
                             ALTER COLUMN document_id SET NOT NULL
                         """
                         )
@@ -153,7 +166,7 @@ class MultiVectorStore(BaseVectorStore):
                 with self.get_connection() as conn:
                     conn.execute(
                         """
-                        CREATE INDEX IF NOT EXISTS idx_multi_vector_document_id 
+                        CREATE INDEX IF NOT EXISTS idx_multi_vector_document_id
                         ON multi_vector_embeddings (document_id)
                     """
                     )
@@ -176,15 +189,17 @@ class MultiVectorStore(BaseVectorStore):
                         """
                         CREATE OR REPLACE FUNCTION max_sim(document bit[], query bit[]) RETURNS double precision AS $$
                             WITH queries AS (
-                                SELECT row_number() OVER () AS query_number, * FROM (SELECT unnest(query) AS query) AS foo
+                                SELECT row_number() OVER () AS query_number, *
+                                FROM (SELECT unnest(query) AS query) AS foo
                             ),
                             documents AS (
                                 SELECT unnest(document) AS document
                             ),
                             similarities AS (
-                                SELECT 
-                                    query_number, 
-                                    1.0 - (bit_count(document # query)::float / greatest(bit_length(query), 1)::float) AS similarity
+                                SELECT
+                                    query_number,
+                                    1.0 - (bit_count(document # query)::float /
+                                        greatest(bit_length(query), 1)::float) AS similarity
                                 FROM queries CROSS JOIN documents
                             ),
                             max_similarities AS (
@@ -211,61 +226,39 @@ class MultiVectorStore(BaseVectorStore):
             embeddings = embeddings.cpu().numpy()
         if isinstance(embeddings, list) and not isinstance(embeddings[0], np.ndarray):
             embeddings = np.array(embeddings)
-        
-        # Add this check to ensure pgvector is registered for the connection
-        with self.get_connection() as conn:
-            register_vector(conn)
-        
+
         return [Bit(embedding > 0) for embedding in embeddings]
 
     async def store_embeddings(self, chunks: List[DocumentChunk]) -> Tuple[bool, List[str]]:
         """Store document chunks with their multi-vector embeddings."""
-        # try:
-        if not chunks:
-            return True, []
-
-        stored_ids = []
-
+        # Prepare a list of row tuples for executemany
+        rows = []
         for chunk in chunks:
-            # Ensure embeddings exist
             if not hasattr(chunk, "embedding") or chunk.embedding is None:
-                logger.error(
-                    f"Missing embeddings for chunk {chunk.document_id}-{chunk.chunk_number}"
-                )
+                logger.error(f"Missing embeddings for chunk {chunk.document_id}-{chunk.chunk_number}")
                 continue
 
-            # For multi-vector embeddings, we expect a list of vectors
-            embeddings = chunk.embedding
+            binary_embeddings = self._binary_quantize(chunk.embedding)
 
-            # Create binary representation for each vector
-            binary_embeddings = self._binary_quantize(embeddings)
-
-            # Insert into database with retry logic
-            with self.get_connection() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO multi_vector_embeddings 
-                    (document_id, chunk_number, content, chunk_metadata, embeddings) 
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (
-                        chunk.document_id,
-                        chunk.chunk_number,
-                        chunk.content,
-                        str(chunk.metadata),
-                        binary_embeddings,
-                    ),
+            rows.append(
+                (
+                    chunk.document_id,
+                    chunk.chunk_number,
+                    chunk.content,
+                    str(chunk.metadata),
+                    binary_embeddings,
                 )
+            )
 
-            stored_ids.append(f"{chunk.document_id}-{chunk.chunk_number}")
+        if not rows:
+            return True, []
 
-        logger.debug(f"{len(stored_ids)} vector embeddings added successfully!")
-        return len(stored_ids) > 0, stored_ids
+        # Off-load blocking DB I/O to a thread so we don't block the event loop
+        await asyncio.to_thread(self._bulk_insert_rows, rows)
 
-        # except Exception as e:
-        #     logger.error(f"Error storing multi-vector embeddings: {str(e)}")
-        #     raise e
-        #     return False, []
+        stored_ids = [f"{r[0]}-{r[1]}" for r in rows]
+        logger.debug(f"{len(stored_ids)} multi-vector embeddings added in bulk")
+        return True, stored_ids
 
     async def query_similar(
         self,
@@ -278,37 +271,44 @@ class MultiVectorStore(BaseVectorStore):
         # Convert query embeddings to binary format
         binary_query_embeddings = self._binary_quantize(query_embedding)
 
-        # Build query
-        query = """
-            SELECT id, document_id, chunk_number, content, chunk_metadata, 
-                    max_sim(embeddings, %s) AS similarity
-            FROM multi_vector_embeddings
-        """
+        def _bit_raw(b: Bit) -> str:
+            """Return raw bit string without 'Bit(...)' wrapper"""
+            s = str(b)
+            # Expected formats: "Bit('1010')" or "Bit(1010)"
+            if s.startswith("Bit("):
+                s = s[4:-1]  # strip wrapper
+                s = s.strip("'")
+            return s
 
-        params = [binary_query_embeddings]
+        bit_strings = [_bit_raw(b) for b in binary_query_embeddings]
+        array_literal = "ARRAY[" + ",".join(f"B'{s}'" for s in bit_strings) + "]::bit(128)[]"
 
-        # Add document filter if needed with proper parameterization
+        # Start query with inlined array literal (internal usage only)
+        query = (
+            "SELECT id, document_id, chunk_number, content, chunk_metadata, "
+            f"max_sim(embeddings, {array_literal}) AS similarity "
+            "FROM multi_vector_embeddings"
+        )
+
+        params: List = []
+
         if doc_ids:
-            # Use placeholders for each document ID
-            placeholders = ', '.join(['%s'] * len(doc_ids))
+            placeholders = ", ".join(["%s"] * len(doc_ids))
             query += f" WHERE document_id IN ({placeholders})"
-            # Add document IDs to params
             params.extend(doc_ids)
 
-        # Add ordering and limit
         query += " ORDER BY similarity DESC LIMIT %s"
         params.append(k)
 
-        # Execute query with retry logic
         with self.get_connection() as conn:
-            result = conn.execute(query, params).fetchall()
+            result = conn.execute(query, tuple(params)).fetchall()
 
         # Convert to DocumentChunks
         chunks = []
         for row in result:
             try:
-                metadata = eval(row[4]) if row[4] else {}
-            except (ValueError, SyntaxError):
+                metadata = json.loads(row[4]) if row[4] else {}
+            except Exception:
                 metadata = {}
 
             chunk = DocumentChunk(
@@ -334,44 +334,44 @@ class MultiVectorStore(BaseVectorStore):
     ) -> List[DocumentChunk]:
         """
         Retrieve specific chunks by document ID and chunk number in a single database query.
-        
+
         Args:
             chunk_identifiers: List of (document_id, chunk_number) tuples
-            
+
         Returns:
             List of DocumentChunk objects
         """
         # try:
         if not chunk_identifiers:
             return []
-            
+
         # Construct the WHERE clause with OR conditions
         conditions = []
         for doc_id, chunk_num in chunk_identifiers:
             conditions.append(f"(document_id = '{doc_id}' AND chunk_number = {chunk_num})")
-        
+
         where_clause = " OR ".join(conditions)
-        
+
         # Build and execute query
         query = f"""
             SELECT document_id, chunk_number, content, chunk_metadata
             FROM multi_vector_embeddings
             WHERE {where_clause}
         """
-        
+
         logger.debug(f"Batch retrieving {len(chunk_identifiers)} chunks from multi-vector store")
-        
+
         with self.get_connection() as conn:
             result = conn.execute(query).fetchall()
-        
+
         # Convert to DocumentChunks
         chunks = []
         for row in result:
             try:
-                metadata = eval(row[3]) if row[3] else {}
-            except (ValueError, SyntaxError):
+                metadata = json.loads(row[3]) if row[3] else {}
+            except Exception:
                 metadata = {}
-                
+
             chunk = DocumentChunk(
                 document_id=row[0],
                 chunk_number=row[1],
@@ -381,17 +381,17 @@ class MultiVectorStore(BaseVectorStore):
                 score=0.0,  # No relevance score for direct retrieval
             )
             chunks.append(chunk)
-            
+
         logger.debug(f"Found {len(chunks)} chunks in batch retrieval from multi-vector store")
         return chunks
-    
+
     async def delete_chunks_by_document_id(self, document_id: str) -> bool:
         """
         Delete all chunks associated with a document.
-        
+
         Args:
             document_id: ID of the document whose chunks should be deleted
-            
+
         Returns:
             bool: True if the operation was successful, False otherwise
         """
@@ -400,19 +400,35 @@ class MultiVectorStore(BaseVectorStore):
             query = f"DELETE FROM multi_vector_embeddings WHERE document_id = '{document_id}'"
             with self.get_connection() as conn:
                 conn.execute(query)
-            
+
             logger.info(f"Deleted all chunks for document {document_id} from multi-vector store")
             return True
-                
+
         except Exception as e:
             logger.error(f"Error deleting chunks for document {document_id} from multi-vector store: {str(e)}")
             return False
-    
+
     def close(self):
         """Close the database connection."""
-        if self.conn:
-            try:
-                self.conn.close()
-                self.conn = None
-            except Exception as e:
-                logger.error(f"Error closing connection: {str(e)}")
+        # Close pool gracefully – this will close all underlying connections
+        try:
+            self.pool.close()
+        except Exception as e:
+            logger.error(f"Error closing connection pool: {e}")
+
+    # ----------------- internal helpers -----------------
+
+    def _bulk_insert_rows(self, rows: List[Tuple]):
+        """Sync helper executed in a worker thread to avoid blocking."""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    """
+                    INSERT INTO multi_vector_embeddings
+                    (document_id, chunk_number, content, chunk_metadata, embeddings)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    rows,
+                )
+                # Single commit for all rows – very fast
+                conn.commit()
