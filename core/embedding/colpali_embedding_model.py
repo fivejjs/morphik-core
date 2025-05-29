@@ -6,9 +6,11 @@ from typing import List, Tuple, Union
 
 import numpy as np
 import torch
-from colpali_engine.models import ColQwen2_5, ColQwen2_5_Processor
-from PIL.Image import Image
-from PIL.Image import open as open_image
+
+from colpali_engine.models import ColQwen2, ColQwen2Processor, ColQwen2_5, ColQwen2_5_Processor
+from transformers.utils.import_utils import is_flash_attn_2_available
+from PIL.Image import Image, open as open_image
+
 
 from core.config import get_settings
 from core.embedding.base_embedding_model import BaseEmbeddingModel
@@ -18,26 +20,35 @@ logger = logging.getLogger(__name__)
 
 
 class ColpaliEmbeddingModel(BaseEmbeddingModel):
-    def __init__(self):
-        device = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Initializing ColpaliEmbeddingModel with device: {device}")
-        start_time = time.time()
-        self.model = ColQwen2_5.from_pretrained(
-            "tsystems/colqwen2.5-3b-multilingual-v1.0",
-            torch_dtype=torch.bfloat16,
-            device_map=device,  # Automatically detect and use available device
-            attn_implementation="flash_attention_2" if device == "cuda" else "eager",
-        ).eval()
-        self.processor: ColQwen2_5_Processor = ColQwen2_5_Processor.from_pretrained(
-            "tsystems/colqwen2.5-3b-multilingual-v1.0"
+    def __init__(self, model_name: str = "vidore/colqwen2.5-v0.2"):
+        device = (
+            "mps"
+            if torch.backends.mps.is_available()
+            else "cuda" if torch.cuda.is_available() else "cpu"
         )
-        self.settings = get_settings()
-        self.mode = self.settings.MODE
-        # Set batch size based on mode
-        self.batch_size = 8 if self.mode == "cloud" else 1
-        logger.info(f"Colpali running in mode: {self.mode} with batch size: {self.batch_size}")
-        total_init_time = time.time() - start_time
-        logger.info(f"Colpali initialization time: {total_init_time:.2f} seconds")
+        match model_name:
+            case "vidore/colqwen2.5-v0.2":
+                self.model = ColQwen2_5.from_pretrained(
+                    "vidore/colqwen2.5-v0.2",
+                    torch_dtype=torch.bfloat16,
+                    device_map=device,  # Automatically detect and use available device
+                    attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "eager",
+                ).eval()
+                self.processor: ColQwen2_5_Processor = ColQwen2_5_Processor.from_pretrained(
+                    "vidore/colqwen2.5-v0.2"
+                )
+            case "vidore/colqwen2-v1.0":
+                self.model = ColQwen2.from_pretrained(
+                    "vidore/colqwen2-v1.0",
+                    torch_dtype=torch.bfloat16,
+                    device_map=device,  # Automatically detect and use available device
+                    attn_implementation="flash_attention_2" if is_flash_attn_2_available() else "eager",
+                ).eval()
+                self.processor: ColQwen2Processor = ColQwen2Processor.from_pretrained(
+                    "vidore/colqwen2-v1.0"
+                )
+            case _:
+                raise ValueError(f"Unsupported model name: {model_name}. Please use 'vidore/colqwen2.5-v0.2' or 'vidore/colqwen2-v1.0'.")
 
     async def embed_for_ingestion(self, chunks: Union[Chunk, List[Chunk]]) -> List[np.ndarray]:
         job_start_time = time.time()
